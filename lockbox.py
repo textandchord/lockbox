@@ -1,5 +1,6 @@
 import hashlib
 from Crypto.Cipher import AES
+from Crypto.Hash import HMAC, SHA256
 from Crypto.Util.Padding import pad, unpad
 from Crypto.Random import get_random_bytes
 from datetime import datetime
@@ -8,36 +9,43 @@ from tzlocal import get_localzone
 
 # AES block size (16 bytes for AES-CBC)
 BLOCK_SIZE = AES.block_size
+# Length of the HMAC-SHA256 tag
+HMAC_SIZE = SHA256.digest_size
 
-def derive_key(password: str) -> bytes:
+def derive_keys(password: str):
     """
-    Derive a 256-bit AES key from the user’s password using SHA-256.
-    Returns a 32-byte digest.
+    Derive two 256-bit keys from the user’s password:
+    - key_enc = SHA256(password || b'enc')
+    - key_mac = SHA256(password || b'mac')
+    Returns (key_enc, key_mac).
     """
-    return hashlib.sha256(password.encode()).digest()
+    pw = password.encode('utf-8')
+    key_enc = hashlib.sha256(pw + b'enc').digest()
+    key_mac = hashlib.sha256(pw + b'mac').digest()
+    return key_enc, key_mac
 
-def encrypt_password(plaintext: str, user_key: bytes) -> bytes:
+def encrypt_secret(plaintext: str, key_enc: bytes) -> bytes:
     """
     Encrypt the given plaintext string using AES-CBC with PKCS#7 padding.
     Generates a random IV and prepends it to the ciphertext.
     Returns IV || ciphertext.
     """
     iv = get_random_bytes(BLOCK_SIZE)
-    cipher = AES.new(user_key, AES.MODE_CBC, iv)
+    cipher = AES.new(key_enc, AES.MODE_CBC, iv)
     padded = pad(plaintext.encode('utf-8'), BLOCK_SIZE)
-    ciphertext = cipher.encrypt(padded)
-    return iv + ciphertext
+    ct = cipher.encrypt(padded)
+    return iv + ct
 
-def decrypt_password(blob: bytes, user_key: bytes) -> str:
+def decrypt_secret(blob: bytes, key_enc: bytes) -> str:
     """
     Decrypt the given blob (IV || ciphertext).
-    Splits out the IV, decrypts and removes PKCS#7 padding, then decodes to UTF-8.
+    Splits out the IV, decrypts, removes PKCS#7 padding, and decodes to UTF-8.
+    May raise ValueError if padding is incorrect (wrong key).
     """
     iv, ct = blob[:BLOCK_SIZE], blob[BLOCK_SIZE:]
-    cipher = AES.new(user_key, AES.MODE_CBC, iv)
+    cipher = AES.new(key_enc, AES.MODE_CBC, iv)
     padded = cipher.decrypt(ct)
-    plaintext = unpad(padded, BLOCK_SIZE)  # may raise ValueError if padding is incorrect
-    return plaintext.decode('utf-8')
+    return unpad(padded, BLOCK_SIZE).decode('utf-8')
 
 def write_lockbox():
     """
@@ -45,9 +53,8 @@ def write_lockbox():
     1. Prompt for an expiry date and validate its format.
     2. Prompt for the secret value and an encryption password.
     3. Prompt for an output filename and ensure it ends with '.lb'.
-    4. Derive the key, encrypt the secret, and write to file:
-       - first line: expiry date in cleartext
-       - rest: encrypted blob (IV + ciphertext)
+    4. Derive keys, encrypt the secret, compute HMAC over date+blob.
+    5. Write to file: [expiry]\n[encrypted_blob][HMAC tag].
     """
     expiry_str = input('Enter expiry date (DD/MM/YYYY HH:MM:SS): ')
     try:
@@ -58,76 +65,110 @@ def write_lockbox():
         return
 
     secret_value = input('Enter value to encrypt: ')
-    user_password = input('Enter encryption password: ')
-    filename = input('Enter output filename (must end with .lb): ')
-
-    # Check .lb extension
+    password     = input('Enter encryption password: ')
+    filename     = input('Enter output filename (must end with .lb): ')
     if not filename.lower().endswith('.lb'):
         print("Error: filename must have a '.lb' extension.")
         return
 
-    # Derive encryption key from user password
-    key = derive_key(user_password)
-    encrypted_blob = encrypt_password(secret_value, key)
+    # Derive two keys from the password
+    key_enc, key_mac = derive_keys(password)
 
-    # Write expiry date and encrypted blob to file
+    # Encrypt the secret
+    encrypted_blob = encrypt_secret(secret_value, key_enc)
+
+    # Build the message to authenticate: expiry_line || '\n' || encrypted_blob
+    msg = expiry_str.encode('ascii') + b'\n' + encrypted_blob
+
+    # Compute HMAC-SHA256 over msg
+    h = HMAC.new(key_mac, digestmod=SHA256)
+    h.update(msg)
+    tag = h.digest()
+
+    # Write all to file
     with open(filename, 'wb') as f:
-        f.write((expiry_str + '\n').encode('ascii'))
-        f.write(encrypted_blob)
+        f.write(msg)
+        f.write(tag)
 
     print(f'Lockbox saved to {filename}')
 
 def read_lockbox():
     """
     Read and decrypt a lockbox file:
-    1. Prompt for the filename and decryption password.
-    2. Ensure the filename ends with '.lb'.
-    3. Read the expiry date (plaintext) and encrypted blob.
-    4. Fetch current time via NTP for tamper-resistance.
-    5. If expired, attempt to decrypt. If the password is wrong, notify the user.
+    1. Prompt for filename (ensuring .lb) and decryption password.
+    2. Read the entire file, split off the HMAC tag.
+    3. Verify HMAC over date+blob; fail if tampered or wrong password.
+    4. Parse expiry date, fetch current time via NTP, compare.
+    5. If expired, decrypt and display; otherwise notify.
     """
     filename = input('Enter lockbox filename (must end with .lb): ')
     if not filename.lower().endswith('.lb'):
         print("Error: filename must have a '.lb' extension.")
         return
 
-    user_password = input('Enter decryption password: ')
-    key = derive_key(user_password)
+    password = input('Enter decryption password: ')
+    key_enc, key_mac = derive_keys(password)
 
     try:
         with open(filename, 'rb') as f:
-            expiry_line = f.readline().decode('ascii').strip()
-            encrypted_blob = f.read()
+            content = f.read()
+    except FileNotFoundError:
+        print('Lockbox file not found.')
+        return
 
-        # Parse expiry date and assign local timezone
-        exp_dt = datetime.strptime(expiry_line, '%d/%m/%Y %H:%M:%S')
-        local_tz = get_localzone()
-        exp_dt = exp_dt.replace(tzinfo=local_tz)
+    # Split off the HMAC tag
+    if len(content) <= HMAC_SIZE:
+        print('Lockbox file is corrupted or too small.')
+        return
+    msg, tag = content[:-HMAC_SIZE], content[-HMAC_SIZE:]
 
-        # Get accurate current time via NTP
+    # Verify HMAC
+    h = HMAC.new(key_mac, digestmod=SHA256)
+    h.update(msg)
+    try:
+        h.verify(tag)
+    except ValueError:
+        print('Integrity check failed: file tampered or wrong password.')
+        return
+
+    # Split expiry date and encrypted blob
+    try:
+        expiry_line, encrypted_blob = msg.split(b'\n', 1)
+    except ValueError:
+        print('Lockbox format error.')
+        return
+
+    # Parse expiry date and assign local timezone
+    try:
+        exp_dt = datetime.strptime(expiry_line.decode('ascii'), '%d/%m/%Y %H:%M:%S')
+    except ValueError:
+        print('Invalid expiry date format in file.')
+        return
+    local_tz = get_localzone()
+    exp_dt = exp_dt.replace(tzinfo=local_tz)
+
+    # Fetch current time via NTP for tamper-resistance
+    try:
         ntp_client = ntplib.NTPClient()
         resp = ntp_client.request('ntp1.inrim.it')
         now = datetime.fromtimestamp(resp.tx_time).astimezone(local_tz)
+    except Exception:
+        print('Could not fetch NTP time; aborting for safety.')
+        return
 
-        # Compare current time to expiry
-        if now < exp_dt:
-            print(f"The timer has not expired yet. Expiration date: {exp_dt}")
-            return
+    # Compare times
+    if now < exp_dt:
+        print(f"The timer has not expired yet. Expiration date: {exp_dt}")
+        return
 
-        # Attempt decryption and check password correctness
-        try:
-            decrypted_value = decrypt_password(encrypted_blob, key)
-        except (ValueError, KeyError):
-            print('Incorrect decryption password.')
-            return
+    # Decrypt and display the secret
+    try:
+        decrypted_value = decrypt_secret(encrypted_blob, key_enc)
+    except ValueError:
+        print('Decryption failed: wrong password or corrupted data.')
+        return
 
-        # If successful, show the secret
-        print(f"Decrypted value: {decrypted_value}")
-
-    except FileNotFoundError:
-        print('Lockbox file not found.')
-    except Exception as e:
-        print('Failed to read or decrypt the lockbox:', e)
+    print(f"Decrypted value: {decrypted_value}")
 
 def main():
     """
